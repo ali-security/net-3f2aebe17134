@@ -1,0 +1,149 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # The library's deps are fully pinned by its go.sum; the registry time
+      # machine is not reachable from GitHub-hosted runners, so the default
+      # proxy.golang.org (checksum-verified against go.sum) is used.
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Go version
+        run: go version && go env
+
+      - name: Package module zip
+        run: |
+          set -euo pipefail
+          # Copy the module tree and drop the seal-authored workflow, so the zip
+          # carries exactly upstream's file set (upstream ships no .github/).
+          mkdir -p "$RUNNER_TEMP/modtree" "$RUNNER_TEMP/helper" "$RUNNER_TEMP/build_output"
+          cp -a src/. "$RUNNER_TEMP/modtree/"
+          rm -rf "$RUNNER_TEMP/modtree/.git"
+          rm -f "$RUNNER_TEMP/modtree/.github/workflows/seal-build.yml"
+          find "$RUNNER_TEMP/modtree/.github" -type d -empty -delete
+          cat > "$RUNNER_TEMP/helper/create_mod.go" <<'EOF'
+          package main
+
+          import (
+            "log"
+            "os"
+
+            "golang.org/x/mod/module"
+            "golang.org/x/mod/zip"
+          )
+
+          func main() {
+            if len(os.Args) != 5 {
+                log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+            }
+            m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+            f, err := os.Create(os.Args[4])
+            if err != nil {
+                log.Fatal(err)
+            }
+            defer f.Close()
+            if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                log.Fatal(err)
+            }
+            log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$RUNNER_TEMP/helper"
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.28.0
+          go run ./create_mod.go golang.org/x/net v0.45.0 "$RUNNER_TEMP/modtree" "$RUNNER_TEMP/build_output/v0.45.0.zip"
+          mkdir -p "$GITHUB_WORKSPACE/build_output"
+          cp "$RUNNER_TEMP/build_output/v0.45.0.zip" "$GITHUB_WORKSPACE/build_output/"
+          unzip -l "$GITHUB_WORKSPACE/build_output/v0.45.0.zip" | tail -n 3
+
+      - name: Build
+        working-directory: src
+        run: go build ./...
+
+      - name: Network setup for ipv4/ipv6/icmp tests
+        run: |
+          # GitHub-hosted runners ship IPv6 disabled on loopback and a closed
+          # ping_group_range; the ipv4/ipv6/icmp tests skip without them.
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          ip addr show lo
+
+      - name: Test
+        working-directory: src
+        run: |
+          set -o pipefail
+          FILTER="${{ inputs.test-filter }}"
+          # -json keeps each test's output (incl. its t.Skip reason) attached to
+          # the test, so the summary below can print every skip with its reason.
+          if [ -n "$FILTER" ]; then
+            go test -json -run "^($(echo "$FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/test.json" | jq -Rrj '. as $l | try (fromjson | if .Action=="output" then .Output else empty end) catch ($l + "\n")'
+            for t in $FILTER; do
+              jq -R 'fromjson? | select(.Action=="run") | .Test' "$RUNNER_TEMP/test.json" | grep -qE "^\"${t}(/|\")" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -json ./... 2>&1 | tee "$RUNNER_TEMP/test.json" | jq -Rrj '. as $l | try (fromjson | if .Action=="output" then .Output else empty end) catch ($l + "\n")'
+          fi
+
+      - name: Test summary
+        if: always()
+        run: |
+          cat > "$RUNNER_TEMP/summary.py" <<'EOF'
+          import json, sys, collections
+          out = collections.defaultdict(list)
+          res = {}
+          pkgs = collections.Counter()
+          for line in open(sys.argv[1]):
+              try:
+                  e = json.loads(line)
+              except ValueError:
+                  continue
+              key = (e.get("Package"), e.get("Test"))
+              if e.get("Action") == "output":
+                  out[key].append(e["Output"])
+              elif e.get("Action") in ("pass", "fail", "skip"):
+                  if e.get("Test"):
+                      res[key] = e["Action"]
+                  else:
+                      pkgs[e["Action"]] += 1
+          c = collections.Counter(res.values())
+          print("Packages: %d ok, %d FAIL, %d without tests/skipped" % (pkgs["pass"], pkgs["fail"], pkgs["skip"]))
+          print("Tests (incl. subtests): %d passed, %d failed, %d skipped" % (c["pass"], c["fail"], c["skip"]))
+          for kind in ("skip", "fail"):
+              print("===== %s tests =====" % ("Skipped" if kind == "skip" else "Failed"))
+              for (pkg, test), a in sorted(res.items()):
+                  if a != kind:
+                      continue
+                  msg = [l.strip() for l in out[(pkg, test)]
+                         if l.strip() and not l.lstrip().startswith(("=== ", "--- "))]
+                  print("%s %s %s: %s" % (kind.upper(), pkg, test, " | ".join(msg) or "(no message)"))
+          EOF
+          touch "$RUNNER_TEMP/test.json"
+          python3 "$RUNNER_TEMP/summary.py" "$RUNNER_TEMP/test.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: golang.org-x-net-v0.45.0
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
